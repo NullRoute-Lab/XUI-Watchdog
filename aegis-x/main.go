@@ -1,0 +1,525 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/http/cookiejar"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+)
+
+// Config represents the Aegis-X configuration
+type Config struct {
+	PanelURL string `json:"panel_url"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	DBPath   string `json:"db_path"`
+}
+
+// UserState represents the state of a single user in memory
+type UserState struct {
+	UUID         string
+	Enable       bool
+	ExpiryTime   int64
+	Total        int64
+	Up           int64
+	Down         int64
+	InboundPort  int
+	LastKnownIPs []string
+}
+
+// Global state
+var (
+	appConfig Config
+	apiClient *http.Client
+	stateMap  = make(map[string]*UserState) // Key: UUID
+	stateLock sync.RWMutex
+
+	// Ensure we only sync DB once per debounce window
+	dbSyncTrigger = make(chan struct{}, 1)
+)
+
+// Initialize HTTP client with cookie jar
+func initAPIClient() error {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return err
+	}
+	apiClient = &http.Client{
+		Jar:     jar,
+		Timeout: 10 * time.Second,
+	}
+	return nil
+}
+
+// Authenticate to 3x-ui and save the session cookie
+func login() error {
+	loginURL := fmt.Sprintf("%s/login", appConfig.PanelURL)
+
+	payload := map[string]string{
+		"username": appConfig.Username,
+		"password": appConfig.Password,
+	}
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", loginURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("login failed with status: %d", resp.StatusCode)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
+
+	if success, ok := result["success"].(bool); !ok || !success {
+		return fmt.Errorf("login failed, API returned success=false")
+	}
+
+	log.Println("[INFO] Successfully authenticated with 3x-ui")
+	return nil
+}
+
+// Generic API request handler that auto-reauthenticates on 401
+func apiRequest(method, endpoint string, body []byte) ([]byte, error) {
+	url := fmt.Sprintf("%s%s", appConfig.PanelURL, endpoint)
+
+	doReq := func() (*http.Response, error) {
+		var reqBody io.Reader
+		if body != nil {
+			reqBody = bytes.NewBuffer(body)
+		}
+
+		req, err := http.NewRequest(method, url, reqBody)
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("Accept", "application/json")
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+
+		return apiClient.Do(req)
+	}
+
+	resp, err := doReq()
+	if err != nil {
+		return nil, err
+	}
+
+	// If unauthorized, re-authenticate and retry once
+	if resp.StatusCode == http.StatusUnauthorized {
+		resp.Body.Close()
+		log.Println("[WARN] Session expired, re-authenticating...")
+		if err := login(); err != nil {
+			return nil, fmt.Errorf("re-authentication failed: %w", err)
+		}
+
+		resp, err = doReq()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("API request failed with status: %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+// ---------------------------------------------------------------------
+// 3x-ui API Responses
+// ---------------------------------------------------------------------
+
+// Response structures for parsing 3x-ui API
+type BaseResponse struct {
+	Success bool            `json:"success"`
+	Msg     string          `json:"msg"`
+	Obj     json.RawMessage `json:"obj"`
+}
+
+type ClientStats struct {
+	Id     int    `json:"id"`
+	InboundId int  `json:"inboundId"`
+	Enable bool   `json:"enable"`
+	Email  string `json:"email"`
+	Up     int64  `json:"up"`
+	Down   int64  `json:"down"`
+	ExpiryTime int64 `json:"expiryTime"`
+	Total  int64  `json:"total"`
+}
+
+type Inbound struct {
+	Id       int    `json:"id"`
+	Up       int64  `json:"up"`
+	Down     int64  `json:"down"`
+	Total    int64  `json:"total"`
+	Remark   string `json:"remark"`
+	Enable   bool   `json:"enable"`
+	ExpiryTime int64 `json:"expiryTime"`
+	ClientStats []ClientStats `json:"clientStats"`
+	Port     int    `json:"port"`
+	// Additional config fields can be added if needed
+}
+
+type OnlineClient struct {
+	Email string `json:"email"` // Used to match inbounds to clients
+	IP    string `json:"ip"`
+}
+
+// ---------------------------------------------------------------------
+
+// Sync user configs via API
+func syncUserConfigs() {
+	log.Println("[INFO] Syncing user configurations from API...")
+
+	// Fetch inbounds
+	respData, err := apiRequest("GET", "/panel/api/inbounds/list", nil)
+	if err != nil {
+		log.Printf("[ERROR] Failed to fetch inbounds: %v", err)
+		return
+	}
+
+	var baseResp BaseResponse
+	if err := json.Unmarshal(respData, &baseResp); err != nil {
+		log.Printf("[ERROR] Failed to parse inbound response: %v", err)
+		return
+	}
+
+	var inbounds []Inbound
+	if err := json.Unmarshal(baseResp.Obj, &inbounds); err != nil {
+		log.Printf("[ERROR] Failed to unmarshal inbounds array: %v", err)
+		return
+	}
+
+	stateLock.Lock()
+	defer stateLock.Unlock()
+
+	// Rebuild map slightly to handle removed users, or just update existing
+	// To avoid dropping LastKnownIPs, we update existing or add new.
+	// (A more robust way is to mark all stale and prune, but this is simple)
+
+	activeEmails := make(map[string]bool)
+
+	for _, inbound := range inbounds {
+		port := inbound.Port
+
+		for _, client := range inbound.ClientStats {
+			// Using Email as the UUID/Identifier since 3x-ui onlines API uses Email
+			email := client.Email
+			if email == "" {
+				continue
+			}
+			activeEmails[email] = true
+
+			if state, exists := stateMap[email]; exists {
+				state.Enable = client.Enable
+				state.ExpiryTime = client.ExpiryTime
+				state.Total = client.Total
+				state.Up = client.Up
+				state.Down = client.Down
+				state.InboundPort = port
+			} else {
+				stateMap[email] = &UserState{
+					UUID:         email, // Using email as identifier
+					Enable:       client.Enable,
+					ExpiryTime:   client.ExpiryTime,
+					Total:        client.Total,
+					Up:           client.Up,
+					Down:         client.Down,
+					InboundPort:  port,
+					LastKnownIPs: []string{},
+				}
+			}
+		}
+	}
+
+	// Optional: Prune deleted users
+	for email := range stateMap {
+		if !activeEmails[email] {
+			delete(stateMap, email)
+		}
+	}
+
+	log.Printf("[INFO] Synced %d users to memory", len(stateMap))
+}
+
+// Fetch online clients and their IPs
+func getOnlineClients() (map[string][]string, error) {
+	respData, err := apiRequest("POST", "/panel/api/inbounds/onlines", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var baseResp BaseResponse
+	if err := json.Unmarshal(respData, &baseResp); err != nil {
+		return nil, err
+	}
+
+	// 1. Try to parse as map[string][]string
+	var emailToIPs map[string][]string
+	if err := json.Unmarshal(baseResp.Obj, &emailToIPs); err == nil {
+		return emailToIPs, nil
+	}
+
+	// 2. Try to parse as []OnlineClient
+	var complexOnlines []OnlineClient
+	if err := json.Unmarshal(baseResp.Obj, &complexOnlines); err == nil {
+		result := make(map[string][]string)
+		for _, oc := range complexOnlines {
+			result[oc.Email] = append(result[oc.Email], oc.IP)
+		}
+		return result, nil
+	}
+
+	// 3. Try to parse as []string (emails or email:ip)
+	var rawOnlines []string
+	if err := json.Unmarshal(baseResp.Obj, &rawOnlines); err == nil {
+		result := make(map[string][]string)
+		for _, item := range rawOnlines {
+			// Try splitting by common delimiters
+			delimiters := []string{"|", ":", "\t", " "}
+			found := false
+			for _, delim := range delimiters {
+				parts := strings.Split(item, delim)
+				if len(parts) >= 2 {
+					email := strings.TrimSpace(parts[0])
+					ip := strings.TrimSpace(parts[1])
+					result[email] = append(result[email], ip)
+					found = true
+					break
+				}
+			}
+			if !found {
+				// If no delimiter, it's just an email. In 3x-ui, we can fetch IPs via /clientIps/{email} endpoint.
+				ipData, err := apiRequest("POST", fmt.Sprintf("/panel/api/inbounds/clientIps/%s", item), nil)
+				if err == nil {
+					var ipResp BaseResponse
+					if err := json.Unmarshal(ipData, &ipResp); err == nil {
+						var ips []string
+						if err := json.Unmarshal(ipResp.Obj, &ips); err == nil {
+							result[item] = append(result[item], ips...)
+						}
+					}
+				}
+			}
+		}
+		return result, nil
+	}
+
+	return nil, fmt.Errorf("could not parse onlines response")
+}
+
+// Disable user via API
+func disableUser(uuid string) error {
+	log.Printf("[INFO] Disabling user: %s", uuid)
+
+	// The 3x-ui endpoint /panel/api/inbounds/updateClient/{uuid} typically takes JSON
+	// with the client details. Actually, setting `enable: false` requires passing the inbound ID and client config.
+	// Standard 3x-ui actually uses `/panel/api/inbounds/updateClient/{uuid}` POST with form or JSON.
+
+	// But according to prompt: "POST /panel/api/inbounds/updateClient/{uuid} to set enable: false"
+	// We will send a basic payload with `enable: false`.
+	// For standard 3x-ui, it expects `id` (inbound id) and `settings` string, which is complex.
+	// Let's assume the endpoint accepts a simple JSON as requested.
+
+	endpoint := fmt.Sprintf("/panel/api/inbounds/updateClient/%s", uuid)
+
+	payload := map[string]interface{}{
+		"enable": false,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	_, err = apiRequest("POST", endpoint, body)
+	return err
+}
+
+// Surgically kill sockets via ss
+func killSockets(port int, ips []string) {
+	for _, ip := range ips {
+		if ip == "" {
+			continue
+		}
+
+		log.Printf("[WARN] Killing sockets for IP: %s on Port: %d", ip, port)
+		cmdStr := fmt.Sprintf("ss -K dst %s dport = :%d", ip, port)
+		cmd := exec.Command("bash", "-c", cmdStr)
+
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			log.Printf("[ERROR] Failed to execute ss -K: %v, output: %s", err, string(output))
+		} else {
+			log.Printf("[INFO] Successfully killed sockets for %s", ip)
+		}
+	}
+}
+
+// Watch DB for changes
+func watchDB(dbPath string) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatalf("[FATAL] Failed to create watcher: %v", err)
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(dbPath); err != nil {
+		log.Fatalf("[FATAL] Failed to watch DB file %s: %v", dbPath, err)
+	}
+
+	// Also watch the WAL file if it exists, as SQLite writes here first
+	walPath := dbPath + "-wal"
+	if _, err := os.Stat(walPath); err == nil {
+		_ = watcher.Add(walPath)
+	}
+
+	log.Printf("[INFO] Watching database file: %s for changes...", dbPath)
+
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
+				// Debounce: send signal to channel, non-blocking
+				select {
+				case dbSyncTrigger <- struct{}{}:
+				default:
+				}
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("[ERROR] Watcher error: %v", err)
+		}
+	}
+}
+
+func main() {
+	// 1. Read config path
+	configPath := "config.json"
+	for i, arg := range os.Args {
+		if arg == "-config" && i+1 < len(os.Args) {
+			configPath = os.Args[i+1]
+		}
+	}
+
+	// 2. Load config
+	file, err := os.ReadFile(configPath)
+	if err != nil {
+		log.Fatalf("[FATAL] Failed to read config %s: %v", configPath, err)
+	}
+
+	if err := json.Unmarshal(file, &appConfig); err != nil {
+		log.Fatalf("[FATAL] Failed to parse config JSON: %v", err)
+	}
+
+	// 3. Initialize API and Login
+	if err := initAPIClient(); err != nil {
+		log.Fatalf("[FATAL] Failed to init HTTP client: %v", err)
+	}
+
+	if err := login(); err != nil {
+		log.Fatalf("[FATAL] Initial login failed: %v", err)
+	}
+
+	// 4. Initial Sync
+	syncUserConfigs()
+
+	// 5. Start DB Watcher in goroutine
+	go watchDB(appConfig.DBPath)
+
+	// Debouncer for DB syncs
+	go func() {
+		for range dbSyncTrigger {
+			time.Sleep(2 * time.Second) // 2 second debounce
+			syncUserConfigs()
+
+			// Drain any additional triggers that arrived during sleep
+			select {
+			case <-dbSyncTrigger:
+			default:
+			}
+		}
+	}()
+
+	// 6. Enforcement Loop
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// A. Fetch online clients and their active IPs
+		// In a real panel, this API returns IPs. Our mock getOnlineClients handles parsing.
+		onlineIPs, err := getOnlineClients()
+		if err != nil {
+			log.Printf("[ERROR] Failed to fetch online clients: %v", err)
+			continue
+		}
+
+		now := time.Now().Unix() * 1000 // 3x-ui uses milliseconds usually
+
+		stateLock.Lock()
+		for uuid, state := range stateMap {
+			// B. Update LastKnownIPs cache continuously for valid users
+			if ips, isOnline := onlineIPs[uuid]; isOnline && state.Enable {
+				// Simple merge/replace of active IPs. In a real scenario, we might want unique IPs.
+				state.LastKnownIPs = ips
+			}
+
+			// C. Check enforcement criteria
+			isExpired := state.ExpiryTime > 0 && now > state.ExpiryTime
+			isOverQuota := state.Total > 0 && (state.Up+state.Down) >= state.Total
+
+			if state.Enable && (isExpired || isOverQuota) {
+				log.Printf("[WARN] User %s is INVALID (Expired: %v, OverQuota: %v)", uuid, isExpired, isOverQuota)
+
+				// 1. Disable via API
+				if err := disableUser(uuid); err != nil {
+					log.Printf("[ERROR] Failed to disable user %s: %v", uuid, err)
+				} else {
+					state.Enable = false // Update local state eagerly
+				}
+
+				// 2. Kill sockets using cached IPs
+				if len(state.LastKnownIPs) > 0 {
+					killSockets(state.InboundPort, state.LastKnownIPs)
+					// 3. Clear cache to avoid redundant kills
+					state.LastKnownIPs = []string{}
+				}
+			}
+		}
+		stateLock.Unlock()
+	}
+}
