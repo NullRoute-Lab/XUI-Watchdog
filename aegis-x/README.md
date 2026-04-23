@@ -65,7 +65,8 @@ The config file is located at `/etc/aegis-x/config.json`. The installer configur
   "panel_url": "http://127.0.0.1:2053",
   "username": "admin",
   "password": "password",
-  "db_path": "/etc/x-ui/x-ui.db"
+  "db_path": "/etc/x-ui/x-ui.db",
+  "check_interval": 5
 }
 ```
 
