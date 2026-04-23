@@ -18,11 +18,12 @@ import (
 
 // Config represents the Aegis-X configuration
 type Config struct {
-	PanelURL      string `json:"panel_url"`
-	Username      string `json:"username"`
-	Password      string `json:"password"`
-	DBPath        string `json:"db_path"`
-	CheckInterval int    `json:"check_interval"`
+	PanelURL        string `json:"panel_url"`
+	Username        string `json:"username"`
+	Password        string `json:"password"`
+	DBPath          string `json:"db_path"`
+	CheckInterval   int    `json:"check_interval"`
+	RestartCooldown int    `json:"restart_cooldown"`
 }
 
 // UserState represents the state of a single user in memory
@@ -42,8 +43,8 @@ var (
 	dbSyncTrigger = make(chan struct{}, 1)
 
 	// Rate Limiting
-	restartTimestamps []time.Time
-	restartLock       sync.Mutex
+	lastRestartTime time.Time
+	restartLock     sync.Mutex
 )
 
 // Initialize HTTP client with cookie jar
@@ -301,36 +302,29 @@ func syncUserConfigs() {
 	log.Printf("[INFO] Synced %d users to memory", len(stateMap))
 }
 
-// Trigger Xray Restart via 3x-ui API with Rate Limiting (max 3 per minute)
+// Trigger Xray Restart via 3x-ui API with Dynamic Cooldown
 func triggerXrayRestart() {
 	restartLock.Lock()
 	defer restartLock.Unlock()
 
-	now := time.Now()
-
-	// Clean up old timestamps (older than 60 seconds)
-	var recentRestarts []time.Time
-	for _, t := range restartTimestamps {
-		if now.Sub(t) <= 60*time.Second {
-			recentRestarts = append(recentRestarts, t)
-		}
+	cooldown := appConfig.RestartCooldown
+	if cooldown <= 0 {
+		cooldown = 5 // default to 5 seconds if not configured or 0
 	}
-	restartTimestamps = recentRestarts
 
-	// Check rate limit (max 3 per 60 seconds)
-	if len(restartTimestamps) >= 3 {
-		log.Printf("[WARN] Rate limit reached: 3 restarts in the last 60 seconds. Ignoring Xray restart request.")
+	if time.Since(lastRestartTime) < time.Duration(cooldown)*time.Second {
+		log.Printf("[WARN] Xray restart skipped due to %d-second cooldown limitation.", cooldown)
 		return
 	}
 
 	log.Println("[INFO] Sending API request to restart Xray core...")
 
-	_, err := apiRequest("POST", "/panel/api/xray/restart", nil)
+	_, err := apiRequest("POST", "/panel/api/server/restartXrayService", nil)
 	if err != nil {
 		log.Printf("[ERROR] Failed to restart Xray via API: %v", err)
 	} else {
-		log.Println("[SUCCESS] Xray core restart triggered successfully.")
-		restartTimestamps = append(restartTimestamps, now)
+		log.Println("[SUCCESS] Xray core restart triggered successfully via /panel/api/server/restartXrayService.")
+		lastRestartTime = time.Now()
 	}
 }
 
