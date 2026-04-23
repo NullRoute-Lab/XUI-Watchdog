@@ -331,9 +331,12 @@ func getOnlineClients() (map[string][]string, error) {
 		return nil, err
 	}
 
+	log.Printf("[DEBUG] Raw /onlines API response obj: %s", string(baseResp.Obj))
+
 	// 1. Try to parse as map[string][]string
 	var emailToIPs map[string][]string
 	if err := json.Unmarshal(baseResp.Obj, &emailToIPs); err == nil {
+		log.Printf("[DEBUG] Parsed /onlines as map[string][]string: %v", emailToIPs)
 		return emailToIPs, nil
 	}
 
@@ -344,6 +347,7 @@ func getOnlineClients() (map[string][]string, error) {
 		for _, oc := range complexOnlines {
 			result[oc.Email] = append(result[oc.Email], oc.IP)
 		}
+		log.Printf("[DEBUG] Parsed /onlines as []OnlineClient: %v", result)
 		return result, nil
 	}
 
@@ -379,6 +383,7 @@ func getOnlineClients() (map[string][]string, error) {
 				}
 			}
 		}
+		log.Printf("[DEBUG] Parsed /onlines as []string: %v", result)
 		return result, nil
 	}
 
@@ -419,7 +424,8 @@ func disableUser(uuid string, inboundId int, clientObj map[string]interface{}) e
 }
 
 // Surgically kill sockets via ss
-func killSockets(port int, ips []string) {
+func killSockets(port int, ips []string) error {
+	var lastErr error
 	for _, ip := range ips {
 		if ip == "" {
 			continue
@@ -432,10 +438,12 @@ func killSockets(port int, ips []string) {
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			log.Printf("[ERROR] Failed to execute ss -K: %v, output: %s", err, string(output))
+			lastErr = err
 		} else {
 			log.Printf("[INFO] Successfully killed sockets for %s", ip)
 		}
 	}
+	return lastErr
 }
 
 // Watch DB for changes
@@ -557,10 +565,20 @@ func main() {
 
 			// C. Check enforcement criteria
 			isExpired := state.ExpiryTime > 0 && now > state.ExpiryTime
-			isOverQuota := state.Total > 0 && (state.Up+state.Down) >= state.Total
+
+			currentUsage := state.Up + state.Down
+			isOverQuota := state.Total > 0 && currentUsage >= state.Total
+
+			// Deep Debug Logging: Show usage ratio for valid users close to their limit (e.g., >80% usage)
+			if state.Enable && state.Total > 0 {
+				usageRatio := float64(currentUsage) / float64(state.Total)
+				if usageRatio > 0.8 && usageRatio < 1.0 {
+					log.Printf("[DEBUG] User %s approaching quota limit: %d / %d (%.2f%%)", uuid, currentUsage, state.Total, usageRatio*100)
+				}
+			}
 
 			if state.Enable && (isExpired || isOverQuota) {
-				log.Printf("[WARN] User %s is INVALID (Expired: %v, OverQuota: %v)", uuid, isExpired, isOverQuota)
+				log.Printf("[WARN] User %s transitioned from VALID to INVALID (Expired: %v, OverQuota: %v, Usage: %d/%d)", uuid, isExpired, isOverQuota, currentUsage, state.Total)
 
 				// 1. Disable via API
 				if err := disableUser(state.UUID, state.InboundId, state.ClientObj); err != nil {
@@ -571,9 +589,20 @@ func main() {
 
 				// 2. Kill sockets using cached IPs
 				if len(state.LastKnownIPs) > 0 {
-					killSockets(state.InboundPort, state.LastKnownIPs)
+					if err := killSockets(state.InboundPort, state.LastKnownIPs); err != nil {
+						// Fallback mechanism: restart Xray if ss -K fails
+						log.Printf("[FALLBACK] ss -K failed to execute. Triggering Xray core restart to prevent data drain.")
+						restartCmd := exec.Command("systemctl", "restart", "xray")
+						if rErr := restartCmd.Run(); rErr != nil {
+							log.Printf("[ERROR] Fallback failed. Could not restart Xray: %v", rErr)
+						} else {
+							log.Printf("[INFO] Xray core successfully restarted as fallback.")
+						}
+					}
 					// 3. Clear cache to avoid redundant kills
 					state.LastKnownIPs = []string{}
+				} else {
+					log.Printf("[DEBUG] No LastKnownIPs cached for user %s to kill sockets.", uuid)
 				}
 			}
 		}
