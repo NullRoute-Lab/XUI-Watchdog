@@ -10,47 +10,114 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
+CONFIG_DIR="/etc/aegis-x"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
+BIN_DEST="/usr/local/bin/aegis-x"
+SERVICE_FILE="/etc/systemd/system/aegis-x.service"
+
 echo -e "${CYAN}=================================================${NC}"
 echo -e "${CYAN}         Aegis-X Daemon Installer                ${NC}"
 echo -e "${CYAN}=================================================${NC}"
 
-# 1. Root Check
+# Root Check
 if [ "$EUID" -ne 0 ]; then
   echo -e "${RED}[ERROR] Please run this installer as root (e.g., sudo ./install.sh)${NC}"
   exit 1
 fi
 
-# 2. Prompt for Configuration
-echo -e "\n${YELLOW}Please provide the following 3x-ui details:${NC}"
+echo -e "\n${YELLOW}Please select an option:${NC}"
+echo "  [1] Install or Update Configuration"
+echo "  [2] Completely Uninstall"
+read -p "Enter choice [1-2]: " MENU_CHOICE
 
-read -p "Panel URL (e.g., http://127.0.0.1:2053): " PANEL_URL
-if [ -z "$PANEL_URL" ]; then
-    PANEL_URL="http://127.0.0.1:2053"
-    echo -e "${YELLOW}Using default Panel URL: ${PANEL_URL}${NC}"
+if [ "$MENU_CHOICE" == "2" ]; then
+    echo -e "\n${CYAN}>>> Uninstalling Aegis-X...${NC}"
+
+    if systemctl is-active --quiet aegis-x; then
+        systemctl stop aegis-x
+    fi
+    if systemctl is-enabled --quiet aegis-x; then
+        systemctl disable aegis-x
+    fi
+
+    rm -f "$SERVICE_FILE"
+    rm -f "$BIN_DEST"
+    rm -rf "$CONFIG_DIR"
+
+    systemctl daemon-reload
+    echo -e "${GREEN}[SUCCESS] Aegis-X has been completely uninstalled.${NC}"
+    exit 0
 fi
 
-read -p "Username: " USERNAME
+if [ "$MENU_CHOICE" != "1" ]; then
+    echo -e "${RED}[ERROR] Invalid choice. Exiting.${NC}"
+    exit 1
+fi
+
+# ==========================================
+# Install or Update Configuration
+# ==========================================
+
+# Default values
+DEF_PANEL_URL="http://127.0.0.1:2053"
+DEF_USERNAME=""
+DEF_PASSWORD=""
+DEF_DB_PATH="/etc/x-ui/x-ui.db"
+DEF_CHECK_INTERVAL="5"
+
+# Parse existing configuration if it exists
+if [ -f "$CONFIG_FILE" ]; then
+    echo -e "\n${GREEN}[INFO] Existing configuration found. Reading defaults...${NC}"
+    # Use python3 to safely extract json keys without relying on jq (since it's a zero-dep script)
+    if command -v python3 &>/dev/null; then
+        DEF_PANEL_URL=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('panel_url', '$DEF_PANEL_URL'))" < "$CONFIG_FILE" 2>/dev/null)
+        DEF_USERNAME=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('username', ''))" < "$CONFIG_FILE" 2>/dev/null)
+        DEF_PASSWORD=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('password', ''))" < "$CONFIG_FILE" 2>/dev/null)
+        DEF_DB_PATH=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('db_path', '$DEF_DB_PATH'))" < "$CONFIG_FILE" 2>/dev/null)
+        DEF_CHECK_INTERVAL=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('check_interval', '$DEF_CHECK_INTERVAL'))" < "$CONFIG_FILE" 2>/dev/null)
+    else
+        # Fallback basic grep/awk parsing if python3 isn't available
+        DEF_PANEL_URL=$(grep '"panel_url"' "$CONFIG_FILE" | cut -d '"' -f 4) || DEF_PANEL_URL="http://127.0.0.1:2053"
+        DEF_USERNAME=$(grep '"username"' "$CONFIG_FILE" | cut -d '"' -f 4)
+        DEF_PASSWORD=$(grep '"password"' "$CONFIG_FILE" | cut -d '"' -f 4)
+        DEF_DB_PATH=$(grep '"db_path"' "$CONFIG_FILE" | cut -d '"' -f 4) || DEF_DB_PATH="/etc/x-ui/x-ui.db"
+        DEF_CHECK_INTERVAL=$(grep '"check_interval"' "$CONFIG_FILE" | tr -d -c 0-9) || DEF_CHECK_INTERVAL="5"
+    fi
+fi
+
+echo -e "\n${YELLOW}Please provide the following 3x-ui details (Press Enter to keep defaults):${NC}"
+
+read -p "Panel URL [$DEF_PANEL_URL]: " PANEL_URL
+PANEL_URL=${PANEL_URL:-$DEF_PANEL_URL}
+
+read -p "Username [$DEF_USERNAME]: " USERNAME
+USERNAME=${USERNAME:-$DEF_USERNAME}
 if [ -z "$USERNAME" ]; then
     echo -e "${RED}[ERROR] Username cannot be empty.${NC}"
     exit 1
 fi
 
-read -s -p "Password: " PASSWORD
-echo ""
+if [ -n "$DEF_PASSWORD" ]; then
+    read -s -p "Password [*** HIDDEN ***]: " PASSWORD
+    echo ""
+    PASSWORD=${PASSWORD:-$DEF_PASSWORD}
+else
+    read -s -p "Password: " PASSWORD
+    echo ""
+fi
 if [ -z "$PASSWORD" ]; then
     echo -e "${RED}[ERROR] Password cannot be empty.${NC}"
     exit 1
 fi
 
-read -p "Database Path (default: /etc/x-ui/x-ui.db): " DB_PATH
-if [ -z "$DB_PATH" ]; then
-    DB_PATH="/etc/x-ui/x-ui.db"
-    echo -e "${YELLOW}Using default Database Path: ${DB_PATH}${NC}"
-fi
+read -p "Database Path [$DEF_DB_PATH]: " DB_PATH
+DB_PATH=${DB_PATH:-$DEF_DB_PATH}
+
+read -p "Check Interval in seconds [$DEF_CHECK_INTERVAL]: " CHECK_INTERVAL
+CHECK_INTERVAL=${CHECK_INTERVAL:-$DEF_CHECK_INTERVAL}
 
 
-# 3. Offline-First Logic (Binary Installation)
-BIN_DEST="/usr/local/bin/aegis-x"
+# Offline-First Logic (Binary Installation)
 echo -e "\n${CYAN}>>> Checking for Aegis-X binary...${NC}"
 
 if [ -f "./aegis-x" ]; then
@@ -80,10 +147,7 @@ chmod +x "$BIN_DEST"
 echo -e "${GREEN}[SUCCESS] Aegis-X binary installed at ${BIN_DEST}${NC}"
 
 
-# 4. Configuration Setup
-CONFIG_DIR="/etc/aegis-x"
-CONFIG_FILE="${CONFIG_DIR}/config.json"
-
+# Configuration Setup
 echo -e "\n${CYAN}>>> Setting up configuration...${NC}"
 mkdir -p "$CONFIG_DIR"
 
@@ -93,7 +157,7 @@ cat > "$CONFIG_FILE" <<EOF
   "username": "$USERNAME",
   "password": "$PASSWORD",
   "db_path": "$DB_PATH",
-  "check_interval": 5
+  "check_interval": $CHECK_INTERVAL
 }
 EOF
 
@@ -101,9 +165,7 @@ chmod 600 "$CONFIG_FILE" # Secure configuration file
 echo -e "${GREEN}[SUCCESS] Configuration created at ${CONFIG_FILE}${NC}"
 
 
-# 5. Systemd Service Setup
-SERVICE_FILE="/etc/systemd/system/aegis-x.service"
-
+# Systemd Service Setup
 echo -e "\n${CYAN}>>> Creating systemd service...${NC}"
 
 cat > "$SERVICE_FILE" <<EOF
@@ -127,11 +189,11 @@ EOF
 echo -e "${GREEN}[SUCCESS] Systemd service created at ${SERVICE_FILE}${NC}"
 
 
-# 6. Start and Enable Daemon
+# Start and Enable Daemon
 echo -e "\n${CYAN}>>> Starting Aegis-X service...${NC}"
 systemctl daemon-reload
 systemctl enable aegis-x
-systemctl start aegis-x
+systemctl restart aegis-x
 
 if systemctl is-active --quiet aegis-x; then
     echo -e "${GREEN}=================================================${NC}"

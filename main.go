@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -57,9 +58,14 @@ func initAPIClient() error {
 	if err != nil {
 		return err
 	}
+
+	customTransport := http.DefaultTransport.(*http.Transport).Clone()
+	customTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+
 	apiClient = &http.Client{
-		Jar:     jar,
-		Timeout: 10 * time.Second,
+		Jar:       jar,
+		Timeout:   10 * time.Second,
+		Transport: customTransport,
 	}
 	return nil
 }
