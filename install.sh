@@ -64,6 +64,7 @@ DEF_USERNAME=""
 DEF_PASSWORD=""
 DEF_DB_PATH="/etc/x-ui/x-ui.db"
 DEF_CHECK_INTERVAL="5"
+DEF_RESTART_COOLDOWN="5"
 
 # Parse existing configuration if it exists
 if [ -f "$CONFIG_FILE" ]; then
@@ -75,6 +76,7 @@ if [ -f "$CONFIG_FILE" ]; then
         DEF_PASSWORD=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('password', ''))" < "$CONFIG_FILE" 2>/dev/null)
         DEF_DB_PATH=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('db_path', '$DEF_DB_PATH'))" < "$CONFIG_FILE" 2>/dev/null)
         DEF_CHECK_INTERVAL=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('check_interval', '$DEF_CHECK_INTERVAL'))" < "$CONFIG_FILE" 2>/dev/null)
+        DEF_RESTART_COOLDOWN=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('restart_cooldown', '$DEF_RESTART_COOLDOWN'))" < "$CONFIG_FILE" 2>/dev/null)
     else
         # Fallback basic grep/awk parsing if python3 isn't available
         DEF_PANEL_URL=$(grep '"panel_url"' "$CONFIG_FILE" | cut -d '"' -f 4) || DEF_PANEL_URL="http://127.0.0.1:2053"
@@ -82,6 +84,7 @@ if [ -f "$CONFIG_FILE" ]; then
         DEF_PASSWORD=$(grep '"password"' "$CONFIG_FILE" | cut -d '"' -f 4)
         DEF_DB_PATH=$(grep '"db_path"' "$CONFIG_FILE" | cut -d '"' -f 4) || DEF_DB_PATH="/etc/x-ui/x-ui.db"
         DEF_CHECK_INTERVAL=$(grep '"check_interval"' "$CONFIG_FILE" | tr -d -c 0-9) || DEF_CHECK_INTERVAL="5"
+        DEF_RESTART_COOLDOWN=$(grep '"restart_cooldown"' "$CONFIG_FILE" | tr -d -c 0-9) || DEF_RESTART_COOLDOWN="5"
     fi
 fi
 
@@ -115,6 +118,9 @@ DB_PATH=${DB_PATH:-$DEF_DB_PATH}
 
 read -p "Check Interval in seconds [$DEF_CHECK_INTERVAL]: " CHECK_INTERVAL
 CHECK_INTERVAL=${CHECK_INTERVAL:-$DEF_CHECK_INTERVAL}
+
+read -p "Restart Cooldown in seconds [$DEF_RESTART_COOLDOWN]: " RESTART_COOLDOWN
+RESTART_COOLDOWN=${RESTART_COOLDOWN:-$DEF_RESTART_COOLDOWN}
 
 
 # Offline-First Logic (Binary Installation)
@@ -157,7 +163,8 @@ cat > "$CONFIG_FILE" <<EOF
   "username": "$USERNAME",
   "password": "$PASSWORD",
   "db_path": "$DB_PATH",
-  "check_interval": $CHECK_INTERVAL
+  "check_interval": $CHECK_INTERVAL,
+  "restart_cooldown": $RESTART_COOLDOWN
 }
 EOF
 
