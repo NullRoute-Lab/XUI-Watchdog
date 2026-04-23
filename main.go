@@ -10,8 +10,6 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"os"
-	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
@@ -29,27 +27,23 @@ type Config struct {
 
 // UserState represents the state of a single user in memory
 type UserState struct {
-	UUID         string
-	Enable       bool
-	ExpiryTime   int64
-	Total        int64
-	Up           int64
-	Down         int64
-	InboundPort  int
-	InboundId    int
-	ClientObj    map[string]interface{}
-	LastKnownIPs []string
+	UUID   string
+	Enable bool
 }
 
 // Global state
 var (
 	appConfig Config
 	apiClient *http.Client
-	stateMap  = make(map[string]*UserState) // Key: UUID
+	stateMap  = make(map[string]*UserState) // Key: Email
 	stateLock sync.RWMutex
 
 	// Ensure we only sync DB once per debounce window
 	dbSyncTrigger = make(chan struct{}, 1)
+
+	// Rate Limiting
+	restartTimestamps []time.Time
+	restartLock       sync.Mutex
 )
 
 // Initialize HTTP client with cookie jar
@@ -238,8 +232,6 @@ func syncUserConfigs() {
 	activeEmails := make(map[string]bool)
 
 	for _, inbound := range inbounds {
-		port := inbound.Port
-
 		// Parse settings to extract clients
 		var settings map[string]interface{}
 		if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
@@ -283,27 +275,17 @@ func syncUserConfigs() {
 			activeEmails[email] = true
 
 			if state, exists := stateMap[email]; exists {
-				state.UUID = uuid
+				// Detect transition from Enable: true -> Enable: false
+				if state.Enable && !client.Enable {
+					log.Printf("[ACTION] User %s disabled by panel. Triggering Xray API Restart to flush ghost connections.", email)
+					triggerXrayRestart()
+				}
 				state.Enable = client.Enable
-				state.ExpiryTime = client.ExpiryTime
-				state.Total = client.Total
-				state.Up = client.Up
-				state.Down = client.Down
-				state.InboundPort = port
-				state.InboundId = inbound.Id
-				state.ClientObj = clientObj
+				state.UUID = uuid
 			} else {
 				stateMap[email] = &UserState{
-					UUID:         uuid,
-					Enable:       client.Enable,
-					ExpiryTime:   client.ExpiryTime,
-					Total:        client.Total,
-					Up:           client.Up,
-					Down:         client.Down,
-					InboundPort:  port,
-					InboundId:    inbound.Id,
-					ClientObj:    clientObj,
-					LastKnownIPs: []string{},
+					UUID:   uuid,
+					Enable: client.Enable,
 				}
 			}
 		}
@@ -319,131 +301,37 @@ func syncUserConfigs() {
 	log.Printf("[INFO] Synced %d users to memory", len(stateMap))
 }
 
-// Fetch online clients and their IPs
-func getOnlineClients() (map[string][]string, error) {
-	respData, err := apiRequest("POST", "/panel/api/inbounds/onlines", nil)
+// Trigger Xray Restart via 3x-ui API with Rate Limiting (max 3 per minute)
+func triggerXrayRestart() {
+	restartLock.Lock()
+	defer restartLock.Unlock()
+
+	now := time.Now()
+
+	// Clean up old timestamps (older than 60 seconds)
+	var recentRestarts []time.Time
+	for _, t := range restartTimestamps {
+		if now.Sub(t) <= 60*time.Second {
+			recentRestarts = append(recentRestarts, t)
+		}
+	}
+	restartTimestamps = recentRestarts
+
+	// Check rate limit (max 3 per 60 seconds)
+	if len(restartTimestamps) >= 3 {
+		log.Printf("[WARN] Rate limit reached: 3 restarts in the last 60 seconds. Ignoring Xray restart request.")
+		return
+	}
+
+	log.Println("[INFO] Sending API request to restart Xray core...")
+
+	_, err := apiRequest("POST", "/panel/api/xray/restart", nil)
 	if err != nil {
-		return nil, err
+		log.Printf("[ERROR] Failed to restart Xray via API: %v", err)
+	} else {
+		log.Println("[SUCCESS] Xray core restart triggered successfully.")
+		restartTimestamps = append(restartTimestamps, now)
 	}
-
-	var baseResp BaseResponse
-	if err := json.Unmarshal(respData, &baseResp); err != nil {
-		return nil, err
-	}
-
-	log.Printf("[DEBUG] Raw /onlines API response obj: %s", string(baseResp.Obj))
-
-	// 1. Try to parse as map[string][]string
-	var emailToIPs map[string][]string
-	if err := json.Unmarshal(baseResp.Obj, &emailToIPs); err == nil {
-		log.Printf("[DEBUG] Parsed /onlines as map[string][]string: %v", emailToIPs)
-		return emailToIPs, nil
-	}
-
-	// 2. Try to parse as []OnlineClient
-	var complexOnlines []OnlineClient
-	if err := json.Unmarshal(baseResp.Obj, &complexOnlines); err == nil {
-		result := make(map[string][]string)
-		for _, oc := range complexOnlines {
-			result[oc.Email] = append(result[oc.Email], oc.IP)
-		}
-		log.Printf("[DEBUG] Parsed /onlines as []OnlineClient: %v", result)
-		return result, nil
-	}
-
-	// 3. Try to parse as []string (emails or email:ip)
-	var rawOnlines []string
-	if err := json.Unmarshal(baseResp.Obj, &rawOnlines); err == nil {
-		result := make(map[string][]string)
-		for _, item := range rawOnlines {
-			// Try splitting by common delimiters
-			delimiters := []string{"|", ":", "\t", " "}
-			found := false
-			for _, delim := range delimiters {
-				parts := strings.Split(item, delim)
-				if len(parts) >= 2 {
-					email := strings.TrimSpace(parts[0])
-					ip := strings.TrimSpace(parts[1])
-					result[email] = append(result[email], ip)
-					found = true
-					break
-				}
-			}
-			if !found {
-				// If no delimiter, it's just an email. In 3x-ui, we can fetch IPs via /clientIps/{email} endpoint.
-				ipData, err := apiRequest("POST", fmt.Sprintf("/panel/api/inbounds/clientIps/%s", item), nil)
-				if err == nil {
-					var ipResp BaseResponse
-					if err := json.Unmarshal(ipData, &ipResp); err == nil {
-						var ips []string
-						if err := json.Unmarshal(ipResp.Obj, &ips); err == nil {
-							result[item] = append(result[item], ips...)
-						}
-					}
-				}
-			}
-		}
-		log.Printf("[DEBUG] Parsed /onlines as []string: %v", result)
-		return result, nil
-	}
-
-	return nil, fmt.Errorf("could not parse onlines response")
-}
-
-// Disable user via API
-func disableUser(uuid string, inboundId int, clientObj map[string]interface{}) error {
-	log.Printf("[INFO] Disabling user: %s", uuid)
-
-	endpoint := fmt.Sprintf("/panel/api/inbounds/updateClient/%s", uuid)
-
-	// Mutate client to disable it
-	clientObj["enable"] = false
-
-	// Structure the settings string exactly as 3x-ui v2.9.2 expects
-	settingsMap := map[string]interface{}{
-		"clients": []map[string]interface{}{clientObj},
-	}
-
-	settingsBytes, err := json.Marshal(settingsMap)
-	if err != nil {
-		return err
-	}
-
-	payload := map[string]interface{}{
-		"id":       inboundId,
-		"settings": string(settingsBytes),
-	}
-
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-
-	_, err = apiRequest("POST", endpoint, body)
-	return err
-}
-
-// Surgically kill sockets via ss
-func killSockets(port int, ips []string) error {
-	var lastErr error
-	for _, ip := range ips {
-		if ip == "" {
-			continue
-		}
-
-		log.Printf("[WARN] Killing sockets for IP: %s on Port: %d", ip, port)
-		cmdStr := fmt.Sprintf("ss -K dst %s dport = :%d", ip, port)
-		cmd := exec.Command("bash", "-c", cmdStr)
-
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			log.Printf("[ERROR] Failed to execute ss -K: %v, output: %s", err, string(output))
-			lastErr = err
-		} else {
-			log.Printf("[INFO] Successfully killed sockets for %s", ip)
-		}
-	}
-	return lastErr
 }
 
 // Watch DB for changes
@@ -537,6 +425,9 @@ func main() {
 	}()
 
 	// 6. Enforcement Loop
+	// The enforcement logic is now implicitly driven by the syncUserConfigs()
+	// which is triggered by the DB watcher. We use the ticker here just as a
+	// failsafe to periodically sync state in case fsnotify misses an event.
 	checkInterval := appConfig.CheckInterval
 	if checkInterval <= 0 {
 		checkInterval = 5 // default to 5 seconds
@@ -545,67 +436,6 @@ func main() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// A. Fetch online clients and their active IPs
-		// In a real panel, this API returns IPs. Our mock getOnlineClients handles parsing.
-		onlineIPs, err := getOnlineClients()
-		if err != nil {
-			log.Printf("[ERROR] Failed to fetch online clients: %v", err)
-			continue
-		}
-
-		now := time.Now().Unix() * 1000 // 3x-ui uses milliseconds usually
-
-		stateLock.Lock()
-		for uuid, state := range stateMap {
-			// B. Update LastKnownIPs cache continuously for valid users
-			if ips, isOnline := onlineIPs[uuid]; isOnline && state.Enable {
-				// Simple merge/replace of active IPs. In a real scenario, we might want unique IPs.
-				state.LastKnownIPs = ips
-			}
-
-			// C. Check enforcement criteria
-			isExpired := state.ExpiryTime > 0 && now > state.ExpiryTime
-
-			currentUsage := state.Up + state.Down
-			isOverQuota := state.Total > 0 && currentUsage >= state.Total
-
-			// Deep Debug Logging: Show usage ratio for valid users close to their limit (e.g., >80% usage)
-			if state.Enable && state.Total > 0 {
-				usageRatio := float64(currentUsage) / float64(state.Total)
-				if usageRatio > 0.8 && usageRatio < 1.0 {
-					log.Printf("[DEBUG] User %s approaching quota limit: %d / %d (%.2f%%)", uuid, currentUsage, state.Total, usageRatio*100)
-				}
-			}
-
-			if state.Enable && (isExpired || isOverQuota) {
-				log.Printf("[WARN] User %s transitioned from VALID to INVALID (Expired: %v, OverQuota: %v, Usage: %d/%d)", uuid, isExpired, isOverQuota, currentUsage, state.Total)
-
-				// 1. Disable via API
-				if err := disableUser(state.UUID, state.InboundId, state.ClientObj); err != nil {
-					log.Printf("[ERROR] Failed to disable user %s: %v", uuid, err)
-				} else {
-					state.Enable = false // Update local state eagerly
-				}
-
-				// 2. Kill sockets using cached IPs
-				if len(state.LastKnownIPs) > 0 {
-					if err := killSockets(state.InboundPort, state.LastKnownIPs); err != nil {
-						// Fallback mechanism: restart Xray if ss -K fails
-						log.Printf("[FALLBACK] ss -K failed to execute. Triggering Xray core restart to prevent data drain.")
-						restartCmd := exec.Command("systemctl", "restart", "xray")
-						if rErr := restartCmd.Run(); rErr != nil {
-							log.Printf("[ERROR] Fallback failed. Could not restart Xray: %v", rErr)
-						} else {
-							log.Printf("[INFO] Xray core successfully restarted as fallback.")
-						}
-					}
-					// 3. Clear cache to avoid redundant kills
-					state.LastKnownIPs = []string{}
-				} else {
-					log.Printf("[DEBUG] No LastKnownIPs cached for user %s to kill sockets.", uuid)
-				}
-			}
-		}
-		stateLock.Unlock()
+		syncUserConfigs()
 	}
 }
