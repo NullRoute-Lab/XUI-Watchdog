@@ -19,10 +19,11 @@ import (
 
 // Config represents the Aegis-X configuration
 type Config struct {
-	PanelURL string `json:"panel_url"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-	DBPath   string `json:"db_path"`
+	PanelURL      string `json:"panel_url"`
+	Username      string `json:"username"`
+	Password      string `json:"password"`
+	DBPath        string `json:"db_path"`
+	CheckInterval int    `json:"check_interval"`
 }
 
 // UserState represents the state of a single user in memory
@@ -34,6 +35,8 @@ type UserState struct {
 	Up           int64
 	Down         int64
 	InboundPort  int
+	InboundId    int
+	ClientObj    map[string]interface{}
 	LastKnownIPs []string
 }
 
@@ -177,16 +180,16 @@ type ClientStats struct {
 }
 
 type Inbound struct {
-	Id       int    `json:"id"`
-	Up       int64  `json:"up"`
-	Down     int64  `json:"down"`
-	Total    int64  `json:"total"`
-	Remark   string `json:"remark"`
-	Enable   bool   `json:"enable"`
-	ExpiryTime int64 `json:"expiryTime"`
+	Id          int           `json:"id"`
+	Up          int64         `json:"up"`
+	Down        int64         `json:"down"`
+	Total       int64         `json:"total"`
+	Remark      string        `json:"remark"`
+	Enable      bool          `json:"enable"`
+	ExpiryTime  int64         `json:"expiryTime"`
 	ClientStats []ClientStats `json:"clientStats"`
-	Port     int    `json:"port"`
-	// Additional config fields can be added if needed
+	Port        int           `json:"port"`
+	Settings    string        `json:"settings"`
 }
 
 type OnlineClient struct {
@@ -231,30 +234,69 @@ func syncUserConfigs() {
 	for _, inbound := range inbounds {
 		port := inbound.Port
 
+		// Parse settings to extract clients
+		var settings map[string]interface{}
+		if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
+			log.Printf("[WARN] Failed to parse settings for inbound %d: %v", inbound.Id, err)
+			continue
+		}
+
+		clients, ok := settings["clients"].([]interface{})
+		if !ok {
+			log.Printf("[WARN] No clients found in settings for inbound %d", inbound.Id)
+			continue
+		}
+
+		clientMap := make(map[string]map[string]interface{})
+		for _, c := range clients {
+			if clientObj, ok := c.(map[string]interface{}); ok {
+				if email, ok := clientObj["email"].(string); ok {
+					clientMap[email] = clientObj
+				}
+			}
+		}
+
 		for _, client := range inbound.ClientStats {
 			// Using Email as the UUID/Identifier since 3x-ui onlines API uses Email
 			email := client.Email
 			if email == "" {
 				continue
 			}
+
+			clientObj, ok := clientMap[email]
+			if !ok {
+				continue
+			}
+
+			// Extract UUID from clientObj
+			uuid := email
+			if id, ok := clientObj["id"].(string); ok {
+				uuid = id
+			}
+
 			activeEmails[email] = true
 
 			if state, exists := stateMap[email]; exists {
+				state.UUID = uuid
 				state.Enable = client.Enable
 				state.ExpiryTime = client.ExpiryTime
 				state.Total = client.Total
 				state.Up = client.Up
 				state.Down = client.Down
 				state.InboundPort = port
+				state.InboundId = inbound.Id
+				state.ClientObj = clientObj
 			} else {
 				stateMap[email] = &UserState{
-					UUID:         email, // Using email as identifier
+					UUID:         uuid,
 					Enable:       client.Enable,
 					ExpiryTime:   client.ExpiryTime,
 					Total:        client.Total,
 					Up:           client.Up,
 					Down:         client.Down,
 					InboundPort:  port,
+					InboundId:    inbound.Id,
+					ClientObj:    clientObj,
 					LastKnownIPs: []string{},
 				}
 			}
@@ -338,22 +380,27 @@ func getOnlineClients() (map[string][]string, error) {
 }
 
 // Disable user via API
-func disableUser(uuid string) error {
+func disableUser(uuid string, inboundId int, clientObj map[string]interface{}) error {
 	log.Printf("[INFO] Disabling user: %s", uuid)
-
-	// The 3x-ui endpoint /panel/api/inbounds/updateClient/{uuid} typically takes JSON
-	// with the client details. Actually, setting `enable: false` requires passing the inbound ID and client config.
-	// Standard 3x-ui actually uses `/panel/api/inbounds/updateClient/{uuid}` POST with form or JSON.
-
-	// But according to prompt: "POST /panel/api/inbounds/updateClient/{uuid} to set enable: false"
-	// We will send a basic payload with `enable: false`.
-	// For standard 3x-ui, it expects `id` (inbound id) and `settings` string, which is complex.
-	// Let's assume the endpoint accepts a simple JSON as requested.
 
 	endpoint := fmt.Sprintf("/panel/api/inbounds/updateClient/%s", uuid)
 
+	// Mutate client to disable it
+	clientObj["enable"] = false
+
+	// Structure the settings string exactly as 3x-ui v2.9.2 expects
+	settingsMap := map[string]interface{}{
+		"clients": []map[string]interface{}{clientObj},
+	}
+
+	settingsBytes, err := json.Marshal(settingsMap)
+	if err != nil {
+		return err
+	}
+
 	payload := map[string]interface{}{
-		"enable": false,
+		"id":       inboundId,
+		"settings": string(settingsBytes),
 	}
 
 	body, err := json.Marshal(payload)
@@ -476,7 +523,11 @@ func main() {
 	}()
 
 	// 6. Enforcement Loop
-	ticker := time.NewTicker(5 * time.Second)
+	checkInterval := appConfig.CheckInterval
+	if checkInterval <= 0 {
+		checkInterval = 5 // default to 5 seconds
+	}
+	ticker := time.NewTicker(time.Duration(checkInterval) * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -506,7 +557,7 @@ func main() {
 				log.Printf("[WARN] User %s is INVALID (Expired: %v, OverQuota: %v)", uuid, isExpired, isOverQuota)
 
 				// 1. Disable via API
-				if err := disableUser(uuid); err != nil {
+				if err := disableUser(state.UUID, state.InboundId, state.ClientObj); err != nil {
 					log.Printf("[ERROR] Failed to disable user %s: %v", uuid, err)
 				} else {
 					state.Enable = false // Update local state eagerly

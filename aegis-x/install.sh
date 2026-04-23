@@ -92,7 +92,8 @@ cat > "$CONFIG_FILE" <<EOF
   "panel_url": "$PANEL_URL",
   "username": "$USERNAME",
   "password": "$PASSWORD",
-  "db_path": "$DB_PATH"
+  "db_path": "$DB_PATH",
+  "check_interval": 5
 }
 EOF
 
@@ -117,6 +118,7 @@ ExecStart=$BIN_DEST -config $CONFIG_FILE
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
+# Note: Log rotation is automatically handled by systemd's journald backend.
 
 [Install]
 WantedBy=multi-user.target
