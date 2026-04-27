@@ -10,20 +10,22 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
 
-// Config represents the Aegis-X configuration
+// Config represents the XUI-Watchdog configuration
 type Config struct {
-	PanelURL        string `json:"panel_url"`
-	Username        string `json:"username"`
-	Password        string `json:"password"`
-	DBPath          string `json:"db_path"`
-	CheckInterval   int    `json:"check_interval"`
-	RestartCooldown int    `json:"restart_cooldown"`
+	PanelURL        string  `json:"panel_url"`
+	Username        string  `json:"username"`
+	Password        string  `json:"password"`
+	DBPath          string  `json:"db_path"`
+	CheckInterval   float64 `json:"check_interval"`
+	RestartCooldown int     `json:"restart_cooldown"`
+	Threshold       float64 `json:"threshold"`
 }
 
 // UserState represents the state of a single user in memory
@@ -289,6 +291,34 @@ func syncUserConfigs() {
 					Enable: client.Enable,
 				}
 			}
+
+			// Pre-emptive Sub-second Kill Logic
+			if client.Enable && client.Total > 0 {
+				threshold := appConfig.Threshold
+				if threshold <= 0 {
+					threshold = 0.995 // Default to 99.5%
+				}
+
+				currentUsage := float64(client.Up + client.Down)
+				quotaLimit := float64(client.Total)
+
+				if currentUsage >= quotaLimit*threshold {
+					log.Printf("[ACTION] User %s exceeded usage threshold (%.2f%%). PRE-EMPTIVELY DISABLING.", email, (currentUsage/quotaLimit)*100)
+
+					// Manually update in-memory state to prevent duplicate triggers
+					if state, exists := stateMap[email]; exists {
+						state.Enable = false
+					}
+
+					// Disable via API
+					if err := disableUser(uuid, inbound.Id, clientObj); err != nil {
+						log.Printf("[ERROR] Pre-emptive disable failed for user %s: %v", email, err)
+					}
+
+					// Trigger restart
+					triggerXrayRestart()
+				}
+			}
 		}
 	}
 
@@ -300,6 +330,39 @@ func syncUserConfigs() {
 	}
 
 	log.Printf("[INFO] Synced %d users to memory", len(stateMap))
+}
+
+// Disable user via API (Pre-emptive Strike)
+func disableUser(uuid string, inboundId int, clientObj map[string]interface{}) error {
+	log.Printf("[INFO] Disabling user: %s", uuid)
+
+	endpoint := fmt.Sprintf("/panel/api/inbounds/updateClient/%s", uuid)
+
+	// Mutate client to disable it
+	clientObj["enable"] = false
+
+	// Structure the settings string exactly as 3x-ui v2.9.2 expects
+	settingsMap := map[string]interface{}{
+		"clients": []map[string]interface{}{clientObj},
+	}
+
+	settingsBytes, err := json.Marshal(settingsMap)
+	if err != nil {
+		return err
+	}
+
+	payload := map[string]interface{}{
+		"id":       inboundId,
+		"settings": string(settingsBytes),
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	_, err = apiRequest("POST", endpoint, body)
+	return err
 }
 
 // Trigger Xray Restart via 3x-ui API with Dynamic Cooldown
@@ -336,17 +399,16 @@ func watchDB(dbPath string) {
 	}
 	defer watcher.Close()
 
-	if err := watcher.Add(dbPath); err != nil {
-		log.Fatalf("[FATAL] Failed to watch DB file %s: %v", dbPath, err)
+	// Watch the parent directory so we don't lose the watch if the DB file is replaced/restored
+	dbDir := filepath.Dir(dbPath)
+	dbBase := filepath.Base(dbPath)
+	walBase := dbBase + "-wal"
+
+	if err := watcher.Add(dbDir); err != nil {
+		log.Fatalf("[FATAL] Failed to watch DB directory %s: %v", dbDir, err)
 	}
 
-	// Also watch the WAL file if it exists, as SQLite writes here first
-	walPath := dbPath + "-wal"
-	if _, err := os.Stat(walPath); err == nil {
-		_ = watcher.Add(walPath)
-	}
-
-	log.Printf("[INFO] Watching database file: %s for changes...", dbPath)
+	log.Printf("[INFO] Watching database directory: %s for changes to %s...", dbDir, dbBase)
 
 	for {
 		select {
@@ -354,6 +416,12 @@ func watchDB(dbPath string) {
 			if !ok {
 				return
 			}
+			// Only react to changes of the specific db file or its wal file
+			baseName := filepath.Base(event.Name)
+			if baseName != dbBase && baseName != walBase {
+				continue
+			}
+
 			if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
 				// Debounce: send signal to channel, non-blocking
 				select {
@@ -421,12 +489,15 @@ func main() {
 	// 6. Enforcement Loop
 	// The enforcement logic is now implicitly driven by the syncUserConfigs()
 	// which is triggered by the DB watcher. We use the ticker here just as a
-	// failsafe to periodically sync state in case fsnotify misses an event.
+	// failsafe to periodically sync state in case fsnotify misses an event,
+	// and to power the pre-emptive sub-second kill logic.
 	checkInterval := appConfig.CheckInterval
 	if checkInterval <= 0 {
-		checkInterval = 5 // default to 5 seconds
+		checkInterval = 0.5 // default to 0.5 seconds
 	}
-	ticker := time.NewTicker(time.Duration(checkInterval) * time.Second)
+
+	tickerDuration := time.Duration(checkInterval * float64(time.Second))
+	ticker := time.NewTicker(tickerDuration)
 	defer ticker.Stop()
 
 	for range ticker.C {

@@ -22,19 +22,19 @@ jobs:
 
       - name: Build Binary
         run: |
-          GOOS=linux GOARCH=amd64 go build -o aegis-x-linux-amd64 main.go
+          GOOS=linux GOARCH=amd64 go build -o xui-watchdog-linux-amd64 main.go
 
       - name: Package Release
         run: |
-          mkdir -p aegis-x-release
-          mv aegis-x-linux-amd64 install.sh README.md aegis-x-release/
-          tar -czvf aegis-x-release.tar.gz aegis-x-release/
+          mkdir -p xui-watchdog-release
+          mv xui-watchdog-linux-amd64 install.sh README.md xui-watchdog-release/
+          tar -czvf xui-watchdog-release.tar.gz xui-watchdog-release/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: v1.0.${{ github.run_number }}
-          name: Aegis-X v1.0.${{ github.run_number }}
-          files: aegis-x-release.tar.gz
+          name: XUI-Watchdog v1.0.${{ github.run_number }}
+          files: xui-watchdog-release.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
