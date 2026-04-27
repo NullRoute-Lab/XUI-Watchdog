@@ -1,4 +1,4 @@
-module aegis-x
+module xui-watchdog
 
 go 1.24.3
 
